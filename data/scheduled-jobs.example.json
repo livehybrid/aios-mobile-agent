@@ -1,0 +1,28 @@
+{
+  "jobs": [
+    {
+      "id": "daily-brief",
+      "name": "Daily brief",
+      "prompt": "Summarise what I should focus on today based on memory and open tasks. One short paragraph.",
+      "cron": "0 8 * * *",
+      "enabled": true,
+      "model": "auto"
+    },
+    {
+      "id": "top-tasks-reminder",
+      "name": "Top tasks reminder",
+      "prompt": "Using memory/MEMORY.md and memory/logs/{{DATE}}.md (today's log), list my top 3–5 tasks or priorities for today. If you have access to Tududi or any task list, prefer tasks from there. Reply with a short bullet list only, no preamble. If nothing is clearly due today, say so in one line.",
+      "cron": "0 8,12,18 * * *",
+      "enabled": true,
+      "model": "auto",
+      "telegramReminder": true
+    },
+    {
+      "id": "webhook-demo",
+      "name": "Triggered by webhook",
+      "prompt": "Append to memory: Webhook was triggered at this time.",
+      "webhookSecret": "your-secret-here",
+      "enabled": true
+    }
+  ]
+}

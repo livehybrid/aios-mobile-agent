@@ -1,0 +1,18 @@
+node_modules/
+data/scheduled-jobs.json
+data/changelogs/
+
+# Local runtime state (do not commit)
+data/telegram-chat-state.json
+data/conversations/
+data/outputs/
+
+# Extra safety if this folder is published standalone
+.env
+.env.*
+.venv/
+venv/
+__pycache__/
+
+# Nested repo metadata (submodule/worktree pointer)
+.git
