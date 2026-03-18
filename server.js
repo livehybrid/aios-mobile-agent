@@ -41,7 +41,7 @@ const CLI_PROFILES = {
   agent: {
     bin: process.env.AGENT_BIN || "agent",
     label: "Cursor Agent",
-    buildArgs(prompt, sessionId, model, mode) {
+    buildArgs(prompt, sessionId, model, mode, _geminiSessionId) {
       const args = ["--print", "--output-format", "stream-json", "--stream-partial-output"];
       args.push("--workspace", WORKSPACE);
       args.push("--trust", "--approve-mcps", "--force");
@@ -56,7 +56,7 @@ const CLI_PROFILES = {
   claude: {
     bin: process.env.CLAUDE_BIN || "claude",
     label: "Claude Code",
-    buildArgs(prompt, sessionId, model, mode) {
+    buildArgs(prompt, sessionId, model, mode, _geminiSessionId) {
       const args = ["--print", "--output-format", "stream-json", "--include-partial-messages"];
       args.push("--dangerously-skip-permissions");
       args.push("--model", model === "auto" || !model ? "sonnet" : model);
@@ -65,6 +65,33 @@ const CLI_PROFILES = {
       args.push(prompt);
       return args;
     },
+    modelsCmd: null,
+  },
+  gemini: {
+    bin: process.env.GEMINI_BIN || "gemini",
+    label: "Gemini CLI",
+    // Gemini CLI headless mode: use plain text output so the
+    // web UI treats each line as raw text (agent-raw) without
+    // requiring a custom event protocol.
+    buildArgs(prompt, sessionId, model /* unused */, mode /* unused */, geminiSessionId) {
+      const args = [];
+      // Headless (-p) has no TTY: run_shell_command and other tools would wait
+      // forever for approval. -y (--yolo) auto-approves. Disable with GEMINI_YOLO=0.
+      const yoloOff = ["0", "false", "off", "no"].includes(
+        String(process.env.GEMINI_YOLO || "").toLowerCase()
+      );
+      if (!yoloOff) args.push("-y");
+      const sid = (geminiSessionId && String(geminiSessionId).trim()) || "";
+      if (sid.length >= 8) args.push("--resume", sid);
+      args.push("-p", prompt);
+      args.push("--output-format", "stream-json");
+      if (model && model !== "auto") {
+        args.push("--model", model);
+      }
+      return args;
+    },
+    // Gemini CLI does not currently expose a simple "models" command
+    // that mirrors Cursor/Claude, so skip model listing for now.
     modelsCmd: null,
   },
 };
@@ -178,7 +205,14 @@ function loadTelegramChatState() {
     if (!fs.existsSync(TELEGRAM_CHAT_STATE_PATH)) return;
     const raw = fs.readFileSync(TELEGRAM_CHAT_STATE_PATH, "utf8");
     const obj = JSON.parse(raw);
-    const defaults = { sessionId: null, sessionIds: [], model: "auto", cli: currentCli, voiceReply: false };
+    const defaults = {
+      sessionId: null,
+      sessionIds: [],
+      geminiSessionId: null,
+      model: "auto",
+      cli: currentCli,
+      voiceReply: false,
+    };
     for (const [key, val] of Object.entries(obj)) {
       const sessionIds = Array.isArray(val.sessionIds) ? val.sessionIds : [];
       const sessionId = val.sessionId || null;
@@ -204,7 +238,14 @@ function saveTelegramChatState() {
 function getChatState(chatId) {
   const key = String(chatId);
   if (!telegramChatState.has(key)) {
-    telegramChatState.set(key, { sessionId: null, sessionIds: [], model: "auto", cli: currentCli, voiceReply: false });
+    telegramChatState.set(key, {
+      sessionId: null,
+      sessionIds: [],
+      geminiSessionId: null,
+      model: "auto",
+      cli: currentCli,
+      voiceReply: false,
+    });
     saveTelegramChatState();
   }
   return telegramChatState.get(key);
@@ -363,7 +404,7 @@ function runAgentHeadless(prompt, opts = {}) {
   const substituted = substitutePromptPlaceholders(prompt);
   const promptWithContext = buildPromptContext() + (substituted || "");
   const profile = CLI_PROFILES[opts.cli || currentCli] || CLI_PROFILES.agent;
-  const args = profile.buildArgs(promptWithContext, null, opts.model || "auto", opts.mode);
+  const args = profile.buildArgs(promptWithContext, null, opts.model || "auto", opts.mode, null);
 
   if (DEBUG) console.log(`[scheduled] spawn (${opts.cli || currentCli}): ${profile.bin} ... "<prompt>" (${(prompt || "").slice(0, 50)}...)`);
 
@@ -585,13 +626,138 @@ function spawnModels(ws, cli) {
   });
 }
 
+/**
+ * One line of stdout from Cursor/Claude stream-json or Gemini stream-json.
+ * Returns false if line is not valid JSON (caller may treat as raw text).
+ */
+function forwardWebAgentStdoutLine(line, session, ws) {
+  try {
+    const event = JSON.parse(line);
+
+    if (event.type === "init" && event.session_id) {
+      if (!session.id) {
+        session.id = event.session_id;
+        sessions.set(session.id, session);
+      }
+      ws.send(
+        JSON.stringify({
+          type: "agent-event",
+          event: { type: "system", session_id: event.session_id, model: event.model },
+        })
+      );
+      return true;
+    }
+
+    if (event.type === "message" && event.role === "assistant" && typeof event.content === "string") {
+      session.assistantTextBuffer += event.content;
+      ws.send(
+        JSON.stringify({
+          type: "agent-event",
+          event: {
+            type: "assistant",
+            message: { content: [{ text: event.content }] },
+            timestamp_ms: Date.now(),
+          },
+        })
+      );
+      return true;
+    }
+
+    if (event.type === "tool_use" && event.tool_id) {
+      ws.send(
+        JSON.stringify({
+          type: "agent-event",
+          event: {
+            type: "tool_use",
+            tool_use_id: event.tool_id,
+            tool_name: event.tool_name || "tool",
+            tool_input: event.parameters || event.tool_input || {},
+          },
+        })
+      );
+      return true;
+    }
+
+    if (event.type === "tool_result" && event.tool_id) {
+      ws.send(
+        JSON.stringify({
+          type: "agent-event",
+          event: { type: "tool_result", tool_use_id: event.tool_id },
+        })
+      );
+      return true;
+    }
+
+    if (event.type === "result" && event.stats) {
+      ws.send(
+        JSON.stringify({
+          type: "agent-event",
+          event: {
+            type: "result",
+            usage: {
+              inputTokens: event.stats.input_tokens,
+              outputTokens: event.stats.output_tokens,
+            },
+            duration_ms: event.stats.duration_ms,
+          },
+        })
+      );
+      return true;
+    }
+
+    if (event.session_id && !session.id) {
+      session.id = event.session_id;
+      sessions.set(session.id, session);
+    }
+    if (event.type === "assistant") {
+      const text = event.message?.content?.[0]?.text || "";
+      if (text && event.timestamp_ms) session.assistantTextBuffer += text;
+    }
+
+    if (DEBUG) {
+      let preview = "";
+      switch (event.type) {
+        case "assistant":
+          preview = `text=${JSON.stringify((event.message?.content?.[0]?.text || "").slice(0, 60))} ts=${event.timestamp_ms ? "delta" : "final"}`;
+          break;
+        case "thinking":
+          preview = `${event.subtype} text=${JSON.stringify((event.text || "").slice(0, 40))}`;
+          break;
+        case "tool_use":
+          preview = `tool=${event.tool_name || event.name} id=${event.tool_use_id}`;
+          break;
+        case "tool_result":
+          preview = `id=${event.tool_use_id}`;
+          break;
+        case "result":
+          preview = `tokens_in=${event.usage?.inputTokens} tokens_out=${event.usage?.outputTokens}`;
+          break;
+        default:
+          preview = event.subtype || String(event.type || "");
+      }
+      console.log(`[agent] event: ${event.type} ${preview}`);
+    }
+
+    ws.send(JSON.stringify({ type: "agent-event", event }));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function handlePrompt(ws, msg, existingSession) {
-  const { prompt, model, sessionId, mode, cli } = msg;
+  const { prompt, model, sessionId, mode, cli, geminiSessionId } = msg;
   if (!prompt?.trim()) return existingSession;
 
   const profile = CLI_PROFILES[cli || currentCli] || CLI_PROFILES.agent;
   const promptWithContext = buildPromptContext() + prompt;
-  const args = profile.buildArgs(promptWithContext, sessionId, model, mode);
+  const args = profile.buildArgs(
+    promptWithContext,
+    sessionId,
+    model,
+    mode,
+    geminiSessionId || null
+  );
 
   if (DEBUG) console.log(`[agent] spawn (${cli || currentCli}): ${profile.bin} ${args.slice(0, -1).join(" ")} "<prompt>"`);
 
@@ -619,44 +785,7 @@ function handlePrompt(ws, msg, existingSession) {
 
     for (const line of lines) {
       if (!line.trim()) continue;
-      try {
-        const event = JSON.parse(line);
-
-        if (event.session_id && !session.id) {
-          session.id = event.session_id;
-          sessions.set(session.id, session);
-        }
-        if (event.type === "assistant") {
-          const text = event.message?.content?.[0]?.text || "";
-          if (text && event.timestamp_ms) session.assistantTextBuffer += text;
-        }
-
-        if (DEBUG) {
-          let preview = "";
-          switch (event.type) {
-            case "assistant":
-              preview = `text=${JSON.stringify((event.message?.content?.[0]?.text || "").slice(0, 60))} ts=${event.timestamp_ms ? "delta" : "final"}`;
-              break;
-            case "thinking":
-              preview = `${event.subtype} text=${JSON.stringify((event.text || "").slice(0, 40))}`;
-              break;
-            case "tool_use":
-              preview = `tool=${event.tool_name || event.name} id=${event.tool_use_id}`;
-              break;
-            case "tool_result":
-              preview = `id=${event.tool_use_id}`;
-              break;
-            case "result":
-              preview = `tokens_in=${event.usage?.inputTokens} tokens_out=${event.usage?.outputTokens}`;
-              break;
-            default:
-              preview = event.subtype || "";
-          }
-          console.log(`[agent] event: ${event.type} ${preview}`);
-        }
-
-        ws.send(JSON.stringify({ type: "agent-event", event }));
-      } catch {
+      if (!forwardWebAgentStdoutLine(line, session, ws)) {
         if (DEBUG) console.log(`[agent] raw: ${line.slice(0, 80)}`);
         ws.send(JSON.stringify({ type: "agent-raw", text: line }));
       }
@@ -674,10 +803,7 @@ function handlePrompt(ws, msg, existingSession) {
   proc.on("close", (code) => {
     if (DEBUG) console.log(`[agent] process exited with code ${code}`);
     if (buffer.trim()) {
-      try {
-        const event = JSON.parse(buffer);
-        ws.send(JSON.stringify({ type: "agent-event", event }));
-      } catch {
+      if (!forwardWebAgentStdoutLine(buffer.trim(), session, ws)) {
         ws.send(JSON.stringify({ type: "agent-raw", text: buffer }));
       }
     }
@@ -1446,7 +1572,8 @@ function runAgentForTelegram(chatId, prompt, replyToMessageId) {
   const state = getChatState(chatId);
   const profile = CLI_PROFILES[state.cli] || CLI_PROFILES[currentCli] || CLI_PROFILES.agent;
   const promptWithContext = buildPromptContext() + prompt;
-  const args = profile.buildArgs(promptWithContext, state.sessionId, state.model);
+  const gemSid = state.cli === "gemini" ? state.geminiSessionId || null : null;
+  const args = profile.buildArgs(promptWithContext, state.sessionId, state.model, undefined, gemSid);
 
   if (DEBUG) console.log(`[telegram] spawn ${state.cli} for chat ${chatId}: ${profile.bin} ${args.slice(0, -1).join(" ")} "<prompt>"`);
 
@@ -1496,32 +1623,48 @@ function runAgentForTelegram(chatId, prompt, replyToMessageId) {
       if (!line.trim()) continue;
       try {
         const event = JSON.parse(line);
-        if (event.session_id && !session.id) {
+
+        if (event.type === "init" && event.session_id) {
+          session.id = event.session_id;
+          if (state.cli === "gemini") {
+            state.geminiSessionId = event.session_id;
+            saveTelegramChatState();
+          }
+        } else if (event.session_id && !session.id) {
           session.id = event.session_id;
           sessions.set(session.id, session);
-          const state = getChatState(chatId);
           state.sessionId = session.id;
           if (!state.sessionIds) state.sessionIds = [];
           state.sessionIds = [session.id, ...state.sessionIds.filter((id) => id !== session.id)].slice(0, 50);
           saveTelegramChatState();
         }
-        if (event.type === "tool_use") {
-          const id = event.tool_use_id || event.id || `${event.tool_name || event.name || "tool"}-${event.timestamp_ms || Date.now()}`;
+
+        if (event.type === "message" && event.role === "assistant" && typeof event.content === "string") {
+          assistantText += event.content;
+          let idx;
+          while ((idx = assistantText.indexOf("\n\n", lastSentIndex)) !== -1) {
+            const paragraph = assistantText.slice(lastSentIndex, idx + 2).trim();
+            lastSentIndex = idx + 2;
+            if (paragraph) sendStreamChunk(paragraph);
+          }
+        } else if (event.type === "tool_use") {
+          const id =
+            event.tool_use_id ||
+            event.tool_id ||
+            event.id ||
+            `${event.tool_name || event.name || "tool"}-${event.timestamp_ms || Date.now()}`;
           if (!sentToolUseIds.has(id)) {
             sentToolUseIds.add(id);
             const name = event.tool_name || event.name || "tool";
             sendStreamChunk(`🔧 Using ${name}...`);
           }
-        }
-        if (event.type === "assistant") {
+        } else if (event.type === "assistant") {
           let text = event.message?.content?.[0]?.text || "";
           if (text && event.timestamp_ms) {
-            // If stream sends cumulative content, only append the new part to avoid duplicate paragraphs
             if (assistantText.length > 0 && text.startsWith(assistantText)) {
               text = text.slice(assistantText.length);
             }
             assistantText += text;
-            // Send each complete paragraph as a separate message
             let idx;
             while ((idx = assistantText.indexOf("\n\n", lastSentIndex)) !== -1) {
               const paragraph = assistantText.slice(lastSentIndex, idx + 2).trim();
@@ -1540,8 +1683,14 @@ function runAgentForTelegram(chatId, prompt, replyToMessageId) {
   proc.on("close", async (code) => {
     if (buffer.trim()) {
       try {
-        const event = JSON.parse(buffer);
-        if (event.type === "assistant") {
+        const event = JSON.parse(buffer.trim());
+        if (event.type === "init" && event.session_id && state.cli === "gemini") {
+          state.geminiSessionId = event.session_id;
+          saveTelegramChatState();
+        }
+        if (event.type === "message" && event.role === "assistant" && typeof event.content === "string") {
+          assistantText += event.content;
+        } else if (event.type === "assistant") {
           const text = event.message?.content?.[0]?.text || "";
           if (text && event.timestamp_ms) assistantText += text;
         }
@@ -1559,10 +1708,10 @@ function runAgentForTelegram(chatId, prompt, replyToMessageId) {
     let toSend = unsentTail;
 
     if (!assistantText.trim()) {
-      toSend = "";
+      const rawText = rawStdoutLines.join("\n").trim();
       if (code !== 0) {
+        toSend = "";
         const stderrText = stderrChunks.join("").trim();
-        const rawText = rawStdoutLines.join("\n").trim();
         console.log(`[telegram] agent error — stderr: ${stderrText.slice(0, 500) || "(empty)"}`);
         console.log(`[telegram] agent error — raw stdout: ${rawText.slice(0, 500) || "(empty)"}`);
         const errParts = [
@@ -1571,6 +1720,9 @@ function runAgentForTelegram(chatId, prompt, replyToMessageId) {
           rawText && `\nOutput:\n${rawText.slice(0, 2000)}`,
         ].filter(Boolean);
         toSend = errParts.length > 1 ? errParts.join("") : `The agent exited with code ${code}. (No stderr or raw output captured.)`;
+      } else if (rawText) {
+        toSend = rawText;
+        console.log(`[telegram] using raw stdout as reply for chat ${chatId} (${rawText.length} chars)`);
       } else {
         console.log(`[telegram] agent returned no text (exit 0) for chat ${chatId}`);
         toSend = "No reply generated.";
@@ -1804,6 +1956,7 @@ async function pollTelegram() {
               case "newchat":
               case "reset": {
                 state.sessionId = null;
+                state.geminiSessionId = null;
                 saveTelegramChatState();
                 console.log(`[telegram] /${cmd} from ${username} — session reset`);
                 await sendTelegramMessage(chatId, "Started a new chat. Your next message will begin a fresh conversation.");
@@ -1836,6 +1989,7 @@ async function pollTelegram() {
                   } else {
                     state.cli = choice;
                     state.sessionId = null;
+                    state.geminiSessionId = null;
                     saveTelegramChatState();
                     console.log(`[telegram] /${cmd} ${choice} from ${username} — CLI set to ${choice}, session reset`);
                     await sendTelegramMessage(chatId,
@@ -1849,7 +2003,7 @@ async function pollTelegram() {
                 const lines = [
                   `Agent: ${state.cli} (${profile.label || "unknown"})`,
                   `Model: ${state.model}`,
-                  `Session: ${state.sessionId || "none"}`,
+                  `Session: ${state.cli === "gemini" ? state.geminiSessionId || "none" : state.sessionId || "none"}`,
                   `Reply with audio (TTS): ${state.voiceReply ? "on" : "off"} — /voice or /graham to toggle`,
                   `Server default agent: ${currentCli}`,
                 ];

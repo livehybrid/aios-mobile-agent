@@ -1324,6 +1324,8 @@ async function submitChangelog() {
 
 let ws = null;
 let currentSessionId = null;
+/** Gemini CLI thread id (separate from Cursor session — required for --resume). */
+let geminiSessionId = null;
 let isRunning = false;
 let currentView = "chat";
 let editingJobId = null;
@@ -1416,7 +1418,9 @@ function handleMessage(msg) {
 function handleAgentEvent(event) {
   switch (event.type) {
     case "system":
-      if (event.session_id) currentSessionId = event.session_id;
+      if (event.session_id && (cliSelect.value || "") !== "gemini") {
+        currentSessionId = event.session_id;
+      }
       setPhase("Connecting to " + (event.model || "model") + "...");
       logActivity("", `Session started · model: ${event.model || "auto"}`);
       break;
@@ -1704,6 +1708,7 @@ function newChat() {
   if (isRunning) return;
   saveCurrentSession();
   currentSessionId = null;
+  geminiSessionId = null;
   thinkingBuffer = "";
   agentTextBuffer = "";
   currentAgentEl = null;
@@ -1767,13 +1772,15 @@ function sendPrompt() {
   currentThinkingEl = null;
   renderPending = false;
 
+  const cliVal = cliSelect.value || undefined;
   ws.send(JSON.stringify({
     type: "prompt",
     prompt,
     model: modelSelect.value,
     mode: modeSelect.value || undefined,
-    cli: cliSelect.value || undefined,
-    sessionId: currentSessionId,
+    cli: cliVal,
+    sessionId: cliVal === "gemini" ? null : currentSessionId,
+    geminiSessionId: cliVal === "gemini" ? geminiSessionId : undefined,
   }));
 
   promptInput.value = "";
@@ -1932,6 +1939,9 @@ function renderUsage(event) {
 }
 
 function finishAgent(msg) {
+  if ((cliSelect.value || "") === "gemini" && msg.sessionId) {
+    geminiSessionId = msg.sessionId;
+  }
   removeTypingIndicator();
   if (agentTextBuffer && currentAgentTextEl) flushMarkdown();
   if (currentAgentEl && agentTextBuffer) {

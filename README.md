@@ -4,7 +4,7 @@ A web-based frontend for interacting with the Cursor Agent (or Claude Code) CLI.
 
 ## What It Does
 
-- **Chat** — Send prompts to the Cursor Agent or Claude Code CLI via a browser. Supports model selection, mode switching (Agent/Plan/Ask), session history, streaming responses with thinking/tool-use visibility, and text-to-speech playback.
+- **Chat** — Send prompts to the Cursor Agent, Claude Code CLI, or Gemini CLI via a browser. Supports model selection, mode switching (Agent/Plan/Ask), session history, streaming responses with thinking/tool-use visibility (for Cursor/Claude), and text-to-speech playback.
 - **Scheduled tasks** — Run prompts on a cron schedule or trigger them via webhook. Optionally send the output to Telegram.
 - **External changelogs** — Accept status updates from other machines (e.g. another laptop) via a simple POST API. Entries are stored and also appended to the AI OS daily log.
 - **Assets** — Browse saved HTML/markdown outputs and workspace report files. View in-place (iframe) or copy shareable links.
@@ -24,8 +24,8 @@ A web-based frontend for interacting with the Cursor Agent (or Claude Code) CLI.
 ### Prerequisites
 
 - **Node.js** 18+ (uses native `fetch`, `AbortSignal.any`, and `FormData`)
-- **Cursor Agent CLI** (`agent`) or **Claude Code CLI** (`claude`) installed and on PATH
-- An active **Claude Code / Cursor** subscription (the CLI handles authentication)
+- **Cursor Agent CLI** (`agent`), **Claude Code CLI** (`claude`), or **Gemini CLI** (`gemini`) installed and on PATH
+- An active subscription for the chosen CLI (Cursor, Claude Code, or Gemini). The CLI itself handles authentication.
 
 ### Install
 
@@ -64,7 +64,10 @@ All variables are optional unless noted. Set them in the project root `.env` fil
 | `WORKSPACE` | `../..` (repo root) | Absolute path to the workspace the agent operates on |
 | `AGENT_BIN` | `agent` | Path or name of the Cursor Agent CLI binary |
 | `CLAUDE_BIN` | `claude` | Path or name of the Claude Code CLI binary |
-| `AGENT_CLI` | `agent` | Which CLI to use by default: `agent` or `claude` |
+| `GEMINI_BIN` | `gemini` | Path or name of the Gemini CLI binary |
+| `GEMINI_YOLO` | _(on)_ | Passes `-y` so headless Gemini can run tools like `run_shell_command` (no TTY to approve). Set to `0` / `false` / `off` to require manual approval (shell tools will not work from this app). Same as `--approval-mode yolo`. |
+| Gemini sessions | — | The app uses Gemini’s `--resume <session_id>` so each chat thread keeps context (like Cursor). **New chat** in the UI or Telegram `/new` clears the Gemini thread. Telegram also stores `geminiSessionId` per chat in `data/telegram-chat-state.json`. |
+| `AGENT_CLI` | `agent` | Which CLI to use by default: `agent`, `claude`, or `gemini` |
 | `AGENT_AUTO_MODEL` | _(none)_ | When the model is set to "auto", override the CLI's default model (e.g. `gpt-5.2-codex`) |
 | `TZ` | `Europe/London` | Timezone for cron schedules and the context timestamp injected into prompts |
 | `DEBUG` | `1` | Set to `1` for verbose server logs (currently always on) |
