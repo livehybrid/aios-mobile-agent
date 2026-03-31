@@ -212,12 +212,19 @@ function loadTelegramChatState() {
       model: "auto",
       cli: currentCli,
       voiceReply: false,
+      muteStreamUpdates: false,
     };
     for (const [key, val] of Object.entries(obj)) {
       const sessionIds = Array.isArray(val.sessionIds) ? val.sessionIds : [];
       const sessionId = val.sessionId || null;
       if (sessionId && !sessionIds.includes(sessionId)) sessionIds.unshift(sessionId);
-      telegramChatState.set(key, { ...defaults, ...val, sessionId, sessionIds: sessionIds.slice(0, 50) });
+      telegramChatState.set(key, {
+        ...defaults,
+        ...val,
+        sessionId,
+        sessionIds: sessionIds.slice(0, 50),
+        muteStreamUpdates: val.muteStreamUpdates === true,
+      });
     }
   } catch (e) {
     if (DEBUG) console.log("[telegram] load chat state:", e.message);
@@ -245,6 +252,7 @@ function getChatState(chatId) {
       model: "auto",
       cli: currentCli,
       voiceReply: false,
+      muteStreamUpdates: false,
     });
     saveTelegramChatState();
   }
@@ -400,6 +408,102 @@ function substitutePromptPlaceholders(prompt) {
   return prompt.replace(/\{\{DATE\}\}/g, dateStr);
 }
 
+/** Some CLIs emit full assistant text on each stream event; append only the new suffix. */
+function appendAssistantDelta(buffer, chunk) {
+  if (!chunk) return buffer;
+  if (buffer.length > 0 && chunk.startsWith(buffer)) {
+    return buffer + chunk.slice(buffer.length);
+  }
+  return buffer + chunk;
+}
+
+function stripThinkBlocks(text) {
+  if (!text || typeof text !== "string") return "";
+  return text
+    .replace(/`?\s*`<think>`[\s\S]*?<\/think>`?/gi, "")
+    .replace(/`?\s*<think>[\s\S]*?<\/think>`?/gi, "")
+    .replace(/`?\s*thinking[\s\S]*?<\/think>`?/gi, "")
+    .replace(/<thinking>[\s\S]*?<\/thinking>/gi, "")
+    .replace(/`?\s*redacted_reasoning[\s\S]*?<\/redacted_reasoning>`?/gi, "")
+    .replace(/\*{0,2}Thinking\*{0,2}[:\s][^\n]*/gi, "");
+}
+
+/**
+ * Cron/webhook → Telegram: model often prepends a plan ("I'll run the script…").
+ * Cut from the first structured brief marker (weather/tasks emojis) when present.
+ */
+function stripScheduledCronPlanningPreamble(text) {
+  const t = (text || "").trim();
+  if (!t) return t;
+  const markers = ["🌤", "🌧", "⛅", "☀️", "🌦", "📋"];
+  let earliest = -1;
+  for (const m of markers) {
+    const i = t.indexOf(m);
+    if (i >= 0 && (earliest < 0 || i < earliest)) earliest = i;
+  }
+  if (earliest > 0) return t.slice(earliest).trim();
+
+  const paras = t.split(/\n\n+/);
+  const planRe =
+    /^(I'll|I will|Let me|I'm going to|I am going to|First,|I've run|I have run|Running |Here is|Here's |Now,|Okay,|OK,|So,)\s/i;
+  let i = 0;
+  while (i < paras.length && i < 6) {
+    const p = paras[i].trim();
+    if (!p) {
+      i++;
+      continue;
+    }
+    if (planRe.test(p)) {
+      i++;
+      continue;
+    }
+    break;
+  }
+  const rest = paras.slice(i).join("\n\n").trim();
+  return rest || t;
+}
+
+function dedupeConsecutiveParagraphs(text) {
+  const parts = text.split(/\n\n+/);
+  const out = [];
+  for (const p of parts) {
+    const t = p.trim();
+    if (!t) continue;
+    if (out.length > 0 && out[out.length - 1] === t) continue;
+    out.push(t);
+  }
+  return out.join("\n\n");
+}
+
+/** Collapse repeated lines (e.g. duplicated stream chunks without paragraph breaks). */
+function dedupeConsecutiveLines(text) {
+  const lines = text.split("\n");
+  const out = [];
+  let prevKey = null;
+  for (const line of lines) {
+    const key = line.trim();
+    if (key !== "" && key === prevKey) continue;
+    out.push(line);
+    prevKey = key === "" ? prevKey : key;
+  }
+  return out.join("\n");
+}
+
+/** User-facing agent text: strip think blocks, fix duplicated stream artifacts. */
+function sanitizeAgentOutputForTelegram(text) {
+  let t = stripThinkBlocks(text || "").trim();
+  t = dedupeConsecutiveParagraphs(t);
+  t = dedupeConsecutiveLines(t);
+  return t.trim();
+}
+
+/** Headless cron/webhook runs: same as Telegram sanitize, plus drop planning before the brief. */
+function sanitizeHeadlessCronOutput(text) {
+  let t = sanitizeAgentOutputForTelegram(text);
+  t = stripScheduledCronPlanningPreamble(t);
+  return t.trim();
+}
+
 function runAgentHeadless(prompt, opts = {}) {
   const substituted = substitutePromptPlaceholders(prompt);
   const promptWithContext = buildPromptContext() + (substituted || "");
@@ -416,38 +520,46 @@ function runAgentHeadless(prompt, opts = {}) {
   let buffer = "";
   let assistantText = "";
 
+  function processLine(line) {
+    if (!line.trim()) return;
+    try {
+      const event = JSON.parse(line);
+      if (event.type === "thinking") {
+        return;
+      }
+      if (event.type === "assistant") {
+        const text = event.message?.content?.[0]?.text || "";
+        // Include chunks even when timestamp_ms is missing (some CLIs only set it on partials).
+        if (text) assistantText = appendAssistantDelta(assistantText, text);
+      } else if (event.type === "message" && event.role === "assistant" && typeof event.content === "string") {
+        assistantText = appendAssistantDelta(assistantText, event.content);
+      } else if (event.type === "tool_use" || event.type === "tool_result") {
+        // Clear accumulated text on tool activity to avoid including planning text in the final output
+        assistantText = "";
+      }
+    } catch {
+      // ignore parse errors
+    }
+  }
+
   proc.stdout.on("data", (chunk) => {
     buffer += chunk.toString();
     const lines = buffer.split("\n");
     buffer = lines.pop();
     for (const line of lines) {
-      if (!line.trim()) continue;
-      try {
-        const event = JSON.parse(line);
-        if (event.type === "assistant") {
-          const text = event.message?.content?.[0]?.text || "";
-          if (text && event.timestamp_ms) assistantText += text;
-        }
-      } catch {
-        // ignore parse errors
-      }
+      processLine(line);
     }
   });
 
   proc.on("close", (code) => {
     if (buffer.trim()) {
-      try {
-        const event = JSON.parse(buffer);
-        if (event.type === "assistant") {
-          const text = event.message?.content?.[0]?.text || "";
-          if (text && event.timestamp_ms) assistantText += text;
-        }
-      } catch {
-        // ignore
-      }
+      processLine(buffer.trim());
     }
     if (DEBUG) console.log(`[scheduled] process exited with code ${code}, output length ${assistantText.length}`);
-    if (typeof opts.onDone === "function") opts.onDone(code, assistantText.trim());
+    if (typeof opts.onDone === "function") {
+      const finalOut = sanitizeHeadlessCronOutput(assistantText);
+      opts.onDone(code, finalOut);
+    }
   });
 
   proc.on("error", (err) => {
@@ -1640,12 +1752,14 @@ function runAgentForTelegram(chatId, prompt, replyToMessageId) {
         }
 
         if (event.type === "message" && event.role === "assistant" && typeof event.content === "string") {
-          assistantText += event.content;
-          let idx;
-          while ((idx = assistantText.indexOf("\n\n", lastSentIndex)) !== -1) {
-            const paragraph = assistantText.slice(lastSentIndex, idx + 2).trim();
-            lastSentIndex = idx + 2;
-            if (paragraph) sendStreamChunk(paragraph);
+          assistantText = appendAssistantDelta(assistantText, event.content);
+          if (!getChatState(chatId).muteStreamUpdates) {
+            let idx;
+            while ((idx = assistantText.indexOf("\n\n", lastSentIndex)) !== -1) {
+              const paragraph = assistantText.slice(lastSentIndex, idx + 2).trim();
+              lastSentIndex = idx + 2;
+              if (paragraph) sendStreamChunk(paragraph);
+            }
           }
         } else if (event.type === "tool_use") {
           const id =
@@ -1661,15 +1775,14 @@ function runAgentForTelegram(chatId, prompt, replyToMessageId) {
         } else if (event.type === "assistant") {
           let text = event.message?.content?.[0]?.text || "";
           if (text && event.timestamp_ms) {
-            if (assistantText.length > 0 && text.startsWith(assistantText)) {
-              text = text.slice(assistantText.length);
-            }
-            assistantText += text;
-            let idx;
-            while ((idx = assistantText.indexOf("\n\n", lastSentIndex)) !== -1) {
-              const paragraph = assistantText.slice(lastSentIndex, idx + 2).trim();
-              lastSentIndex = idx + 2;
-              if (paragraph) sendStreamChunk(paragraph);
+            assistantText = appendAssistantDelta(assistantText, text);
+            if (!getChatState(chatId).muteStreamUpdates) {
+              let idx;
+              while ((idx = assistantText.indexOf("\n\n", lastSentIndex)) !== -1) {
+                const paragraph = assistantText.slice(lastSentIndex, idx + 2).trim();
+                lastSentIndex = idx + 2;
+                if (paragraph) sendStreamChunk(paragraph);
+              }
             }
           }
         }
@@ -1689,10 +1802,10 @@ function runAgentForTelegram(chatId, prompt, replyToMessageId) {
           saveTelegramChatState();
         }
         if (event.type === "message" && event.role === "assistant" && typeof event.content === "string") {
-          assistantText += event.content;
+          assistantText = appendAssistantDelta(assistantText, event.content);
         } else if (event.type === "assistant") {
           const text = event.message?.content?.[0]?.text || "";
-          if (text && event.timestamp_ms) assistantText += text;
+          if (text && event.timestamp_ms) assistantText = appendAssistantDelta(assistantText, text);
         }
       } catch {
         rawStdoutLines.push(buffer.trim());
@@ -1703,6 +1816,7 @@ function runAgentForTelegram(chatId, prompt, replyToMessageId) {
     const elapsed = Date.now() - session.messages[0].timestamp;
     console.log(`[telegram] agent exited (code ${code}) for chat ${chatId} after ${(elapsed / 1000).toFixed(1)}s — output: ${assistantText.length} chars`);
 
+    const streamQuiet = getChatState(chatId).muteStreamUpdates;
     // Only send the unsent remainder (we already sent paragraphs during stream); avoid sending full message again
     const unsentTail = assistantText.slice(lastSentIndex).trim();
     let toSend = unsentTail;
@@ -1727,9 +1841,18 @@ function runAgentForTelegram(chatId, prompt, replyToMessageId) {
         console.log(`[telegram] agent returned no text (exit 0) for chat ${chatId}`);
         toSend = "No reply generated.";
       }
-    } else if (unsentTail && unsentTail !== lastSentContent) {
+    } else if (streamQuiet) {
+      toSend = sanitizeAgentOutputForTelegram(assistantText.trim());
       const preview = toSend.length > 200 ? toSend.slice(0, 200) + "…" : toSend;
-      console.log(`[telegram] sending unsent tail to chat ${chatId}: "${preview}"`);
+      console.log(`[telegram] quiet mode: sending full reply to chat ${chatId}: "${preview}"`);
+    } else {
+      toSend = unsentTail ? sanitizeAgentOutputForTelegram(unsentTail) : "";
+      if (toSend && toSend !== lastSentContent) {
+        const preview = toSend.length > 200 ? toSend.slice(0, 200) + "…" : toSend;
+        console.log(`[telegram] sending unsent tail to chat ${chatId}: "${preview}"`);
+      } else if (toSend && toSend === lastSentContent) {
+        toSend = "";
+      }
     }
     // If we already sent everything during stream (unsentTail empty and we had content), skip final send
 
@@ -1751,7 +1874,7 @@ function runAgentForTelegram(chatId, prompt, replyToMessageId) {
           }
         }
       }
-    } else if (assistantText.trim()) {
+    } else if (assistantText.trim() && !streamQuiet) {
       sent = true; // already sent in full via stream chunks
     }
 
@@ -1764,7 +1887,7 @@ function runAgentForTelegram(chatId, prompt, replyToMessageId) {
     }
 
     // If user has reply-with-audio on, send TTS version
-    const fullResponseText = assistantText.trim();
+    const fullResponseText = sanitizeAgentOutputForTelegram(assistantText.trim());
     const currentState = getChatState(chatId);
     if (code === 0 && fullResponseText && currentState.voiceReply && fs.existsSync(TTS_SCRIPT)) {
       const ttsPath = path.join(os.tmpdir(), `tg_tts_${chatId}_${Date.now()}.mp3`);
@@ -1797,7 +1920,7 @@ function runAgentForTelegram(chatId, prompt, replyToMessageId) {
     }
 
     if (session.id && assistantText.trim()) {
-      saveConversationTurn(session.id, "auto", session.startedAt, prompt, assistantText.trim(), { telegramChatId: chatId });
+      saveConversationTurn(session.id, "auto", session.startedAt, prompt, fullResponseText || sanitizeAgentOutputForTelegram(assistantText.trim()), { telegramChatId: chatId });
     }
   });
 
@@ -1838,6 +1961,8 @@ async function pollTelegram() {
         { command: "agent", description: "Switch CLI agent (e.g. /agent claude)" },
         { command: "voice", description: "Toggle reply with audio (TTS)" },
         { command: "graham", description: "Same as /voice — TTS replies" },
+        { command: "quiet", description: "Toggle: final reply only (no stream chunks)" },
+        { command: "nothinking", description: "Same as /quiet — hide streaming updates" },
         { command: "status", description: "Show current settings" },
         { command: "help", description: "Show available commands" },
       ],
@@ -1952,6 +2077,19 @@ async function pollTelegram() {
                 await sendTelegramMessage(chatId, `Reply with audio (TTS) is now ${state.voiceReply ? "on" : "off"}. Send /voice or /graham again to toggle.`);
                 continue;
               }
+              case "quiet":
+              case "nothinking": {
+                state.muteStreamUpdates = !state.muteStreamUpdates;
+                saveTelegramChatState();
+                console.log(`[telegram] muteStreamUpdates for chat ${chatId} → ${state.muteStreamUpdates}`);
+                await sendTelegramMessage(
+                  chatId,
+                  state.muteStreamUpdates
+                    ? "Quiet mode on: one final reply per message (no streaming assistant paragraphs). Tool lines (🔧) still show. Send /quiet or /nothinking again to turn off."
+                    : "Quiet mode off: assistant paragraphs stream as before. Send /quiet or /nothinking to hide streaming text."
+                );
+                continue;
+              }
               case "new":
               case "newchat":
               case "reset": {
@@ -2005,6 +2143,7 @@ async function pollTelegram() {
                   `Model: ${state.model}`,
                   `Session: ${state.cli === "gemini" ? state.geminiSessionId || "none" : state.sessionId || "none"}`,
                   `Reply with audio (TTS): ${state.voiceReply ? "on" : "off"} — /voice or /graham to toggle`,
+                  `Quiet mode (no stream chunks): ${state.muteStreamUpdates ? "on" : "off"} — /quiet or /nothinking to toggle`,
                   `Server default agent: ${currentCli}`,
                 ];
                 await sendTelegramMessage(chatId, lines.join("\n"));
@@ -2021,6 +2160,7 @@ async function pollTelegram() {
                   "/model <name> — Set model (e.g. sonnet, opus, auto)",
                   "/agent <name> — Switch CLI agent (e.g. agent, claude)",
                   "/voice or /graham — Toggle reply with audio (TTS)",
+                  "/quiet or /nothinking — Toggle quiet replies (one bubble; no streaming paragraphs)",
                   "/status — Show current settings",
                   "/help — Show this message",
                   "",
