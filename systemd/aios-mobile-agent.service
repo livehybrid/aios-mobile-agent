@@ -1,0 +1,21 @@
+[Unit]
+Description=AIOS Mobile Agent Web UI
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/root/aios/apps/aios-mobile-agent
+Environment=NODE_ENV=production
+Environment=PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStartPre=/root/aios/apps/aios-mobile-agent/systemd/kill-stale-server.sh
+ExecStart=/usr/bin/npm start
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
