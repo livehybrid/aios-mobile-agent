@@ -16,3 +16,4 @@ __pycache__/
 
 # Nested repo metadata (submodule/worktree pointer)
 .git
+downloads/
