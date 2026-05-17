@@ -37,6 +37,11 @@ const WORKSPACE = process.env.WORKSPACE || path.resolve(__dirname, "../..");
 const REPORTS_DIR = path.join(WORKSPACE, ".tmp");
 const DEBUG = process.env.DEBUG === "1";
 
+/** Claude Code exits if --dangerously-skip-permissions is used while UID is root. */
+function isRootUnixProcess() {
+  return typeof process.getuid === "function" && process.getuid() === 0;
+}
+
 const CLI_PROFILES = {
   agent: {
     bin: process.env.AGENT_BIN || "agent",
@@ -47,7 +52,7 @@ const CLI_PROFILES = {
       args.push("--trust", "--approve-mcps", "--force");
       args.push("--model", model === "auto" || !model ? "auto" : model);
       if (mode) args.push("--mode", mode);
-      if (sessionId && sessions.has(sessionId)) args.push("--resume", sessionId);
+      if (sessionId) args.push("--resume", sessionId);
       args.push(prompt);
       return args;
     },
@@ -57,11 +62,13 @@ const CLI_PROFILES = {
     bin: process.env.CLAUDE_BIN || "claude",
     label: "Claude Code",
     buildArgs(prompt, sessionId, model, mode, _geminiSessionId) {
-      const args = ["--print", "--output-format", "stream-json", "--include-partial-messages"];
-      args.push("--dangerously-skip-permissions");
+      const args = ["--print", "--output-format", "stream-json", "--verbose", "--include-partial-messages"];
+      if (!isRootUnixProcess()) {
+        args.push("--dangerously-skip-permissions");
+      }
       args.push("--model", model === "auto" || !model ? "sonnet" : model);
       if (mode) args.push("--mode", mode);
-      if (sessionId && sessions.has(sessionId)) args.push("--resume", sessionId);
+      if (sessionId) args.push("--resume", sessionId);
       args.push(prompt);
       return args;
     },
@@ -515,6 +522,7 @@ function runAgentHeadless(prompt, opts = {}) {
   const proc = spawn(profile.bin, args, {
     env: { ...process.env },
     cwd: WORKSPACE,
+    stdio: ["ignore", "pipe", "pipe"],
   });
 
   let buffer = "";
@@ -723,7 +731,10 @@ function spawnModels(ws, cli) {
     ws.send(JSON.stringify({ type: "models", models: [], note: `${profile.label} does not support listing models` }));
     return;
   }
-  const proc = spawn(profile.bin, profile.modelsCmd, { env: { ...process.env } });
+  const proc = spawn(profile.bin, profile.modelsCmd, {
+    env: { ...process.env },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
   let out = "";
   proc.stdout.on("data", (d) => (out += d.toString()));
   proc.on("close", () => {
@@ -823,7 +834,8 @@ function forwardWebAgentStdoutLine(line, session, ws) {
     }
     if (event.type === "assistant") {
       const text = event.message?.content?.[0]?.text || "";
-      if (text && event.timestamp_ms) session.assistantTextBuffer += text;
+      // Claude Code often omits timestamp_ms on the final assistant message; Cursor may include it on partials.
+      if (text) session.assistantTextBuffer = appendAssistantDelta(session.assistantTextBuffer, text);
     }
 
     if (DEBUG) {
@@ -876,6 +888,7 @@ function handlePrompt(ws, msg, existingSession) {
   const proc = spawn(profile.bin, args, {
     env: { ...process.env },
     cwd: WORKSPACE,
+    stdio: ["ignore", "pipe", "pipe"],
   });
 
   const session = {
@@ -1680,6 +1693,38 @@ async function sendTelegramMessage(chatId, text, opts = {}) {
   }
 }
 
+/** Split a trailing <options>…</options> block (see CLAUDE.md headless rules)
+ *  off the end of an agent reply. Returns the cleaned text and the options. */
+function extractOptionsBlock(text) {
+  const s = String(text || "");
+  const m = s.match(/\n*<options>\s*([\s\S]*?)\s*<\/options>\s*$/i);
+  if (!m) return { text: s, options: null };
+  const options = m[1]
+    .split("\n").map((l) => l.trim()).filter(Boolean).slice(0, 12);
+  return {
+    text: s.slice(0, m.index).trimEnd(),
+    options: options.length ? options : null,
+  };
+}
+
+/** Render agent-offered choices as a one-tap Telegram inline keyboard. The
+ *  tapped option comes back as a callback_query (handled in the poll loop). */
+async function sendOptionsKeyboard(chatId, options) {
+  const inline_keyboard = options.slice(0, 12).map((opt) => [{
+    text: opt.length > 64 ? opt.slice(0, 63) + "…" : opt,
+    callback_data: opt.slice(0, 60), // Telegram caps callback_data at 64 bytes
+  }]);
+  try {
+    await telegramApi("sendMessage", {
+      chat_id: chatId,
+      text: "👇 Tap to choose — or just reply:",
+      reply_markup: { inline_keyboard },
+    });
+  } catch (e) {
+    if (DEBUG) console.log("[telegram] sendOptionsKeyboard error:", e.message);
+  }
+}
+
 function runAgentForTelegram(chatId, prompt, replyToMessageId) {
   const state = getChatState(chatId);
   const profile = CLI_PROFILES[state.cli] || CLI_PROFILES[currentCli] || CLI_PROFILES.agent;
@@ -1692,6 +1737,7 @@ function runAgentForTelegram(chatId, prompt, replyToMessageId) {
   const proc = spawn(profile.bin, args, {
     env: { ...process.env },
     cwd: WORKSPACE,
+    stdio: ["ignore", "pipe", "pipe"],
   });
 
   const session = {
@@ -1712,6 +1758,7 @@ function runAgentForTelegram(chatId, prompt, replyToMessageId) {
   async function sendStreamChunk(chunkText) {
     const trimmed = chunkText && chunkText.trim();
     if (!trimmed) return;
+    if (/<\/?options>/i.test(trimmed)) return; // options block — rendered as buttons at end of turn
     if (trimmed === lastSentContent) return; // suppress duplicate
     lastSentContent = trimmed;
     try {
@@ -1740,6 +1787,12 @@ function runAgentForTelegram(chatId, prompt, replyToMessageId) {
           session.id = event.session_id;
           if (state.cli === "gemini") {
             state.geminiSessionId = event.session_id;
+            saveTelegramChatState();
+          } else {
+            sessions.set(session.id, session);
+            state.sessionId = session.id;
+            if (!state.sessionIds) state.sessionIds = [];
+            state.sessionIds = [session.id, ...state.sessionIds.filter((id) => id !== session.id)].slice(0, 50);
             saveTelegramChatState();
           }
         } else if (event.session_id && !session.id) {
@@ -1773,8 +1826,8 @@ function runAgentForTelegram(chatId, prompt, replyToMessageId) {
             sendStreamChunk(`🔧 Using ${name}...`);
           }
         } else if (event.type === "assistant") {
-          let text = event.message?.content?.[0]?.text || "";
-          if (text && event.timestamp_ms) {
+          const text = event.message?.content?.[0]?.text || "";
+          if (text) {
             assistantText = appendAssistantDelta(assistantText, text);
             if (!getChatState(chatId).muteStreamUpdates) {
               let idx;
@@ -1797,15 +1850,24 @@ function runAgentForTelegram(chatId, prompt, replyToMessageId) {
     if (buffer.trim()) {
       try {
         const event = JSON.parse(buffer.trim());
-        if (event.type === "init" && event.session_id && state.cli === "gemini") {
-          state.geminiSessionId = event.session_id;
-          saveTelegramChatState();
+        if (event.type === "init" && event.session_id) {
+          if (state.cli === "gemini") {
+            state.geminiSessionId = event.session_id;
+            saveTelegramChatState();
+          } else if (!session.id) {
+            session.id = event.session_id;
+            sessions.set(session.id, session);
+            state.sessionId = session.id;
+            if (!state.sessionIds) state.sessionIds = [];
+            state.sessionIds = [session.id, ...state.sessionIds.filter((id) => id !== session.id)].slice(0, 50);
+            saveTelegramChatState();
+          }
         }
         if (event.type === "message" && event.role === "assistant" && typeof event.content === "string") {
           assistantText = appendAssistantDelta(assistantText, event.content);
         } else if (event.type === "assistant") {
           const text = event.message?.content?.[0]?.text || "";
-          if (text && event.timestamp_ms) assistantText = appendAssistantDelta(assistantText, text);
+          if (text) assistantText = appendAssistantDelta(assistantText, text);
         }
       } catch {
         rawStdoutLines.push(buffer.trim());
@@ -1856,6 +1918,13 @@ function runAgentForTelegram(chatId, prompt, replyToMessageId) {
     }
     // If we already sent everything during stream (unsentTail empty and we had content), skip final send
 
+    // A trailing <options> block is rendered as a tappable inline keyboard
+    // (below) rather than sent as literal text.
+    const offeredOptions = extractOptionsBlock(assistantText).options;
+    if (offeredOptions) {
+      toSend = toSend.replace(/\n*<options>[\s\S]*?<\/options>\s*$/i, "").trimEnd();
+    }
+
     let sent = false;
     if (toSend.length > 0) {
       for (let attempt = 1; attempt <= 3; attempt++) {
@@ -1876,6 +1945,11 @@ function runAgentForTelegram(chatId, prompt, replyToMessageId) {
       }
     } else if (assistantText.trim() && !streamQuiet) {
       sent = true; // already sent in full via stream chunks
+    }
+
+    // Offer the agent's choices as tappable buttons (handled via callback_query).
+    if (offeredOptions) {
+      await sendOptionsKeyboard(chatId, offeredOptions);
     }
 
     if (replyToMessageId) {
@@ -1954,16 +2028,20 @@ async function pollTelegram() {
   try {
     const cmds = await telegramApi("setMyCommands", {
       commands: [
+        { command: "ping", description: "Quick online check — model, effort, session count" },
+        { command: "todo", description: "List pending tasks" },
+        { command: "brief", description: "Trigger your daily briefing now" },
+        { command: "farsley", description: "Show Farsley house context and status" },
+        { command: "remember", description: "Save something to memory: /remember <text>" },
         { command: "new", description: "Start a fresh conversation" },
         { command: "convos", description: "List recent conversations" },
         { command: "convo", description: "Switch to conversation (e.g. /convo 1)" },
         { command: "model", description: "Set model (e.g. /model sonnet)" },
         { command: "agent", description: "Switch CLI agent (e.g. /agent claude)" },
         { command: "voice", description: "Toggle reply with audio (TTS)" },
-        { command: "graham", description: "Same as /voice — TTS replies" },
         { command: "quiet", description: "Toggle: final reply only (no stream chunks)" },
-        { command: "nothinking", description: "Same as /quiet — hide streaming updates" },
-        { command: "status", description: "Show current settings" },
+        { command: "usage", description: "Show Claude plan quota and token stats" },
+        { command: "context", description: "Token breakdown by session — what's using quota" },
         { command: "help", description: "Show available commands" },
       ],
     });
@@ -1980,7 +2058,7 @@ async function pollTelegram() {
       const result = await telegramApi("getUpdates", {
         offset: telegramOffset,
         timeout: 30,
-        allowed_updates: ["message"],
+        allowed_updates: ["message", "callback_query"],
       }, { signal: telegramPollAbort.signal });
 
       if (!result.ok) {
@@ -1998,13 +2076,36 @@ async function pollTelegram() {
       }
       for (const u of updates) {
         telegramOffset = u.update_id + 1;
+
+        // A tapped inline-keyboard button arrives as a callback_query. Treat the
+        // tapped option as if the user had typed it, so the normal flow
+        // (allowlist, agent run, session resume) handles it with no changes.
+        if (u.callback_query) {
+          const cb = u.callback_query;
+          telegramApi("answerCallbackQuery", { callback_query_id: cb.id }).catch(() => {});
+          if (cb.message?.chat?.id && cb.message?.message_id) {
+            // Drop the keyboard so the same choice can't be tapped twice.
+            telegramApi("editMessageReplyMarkup", {
+              chat_id: cb.message.chat.id,
+              message_id: cb.message.message_id,
+              reply_markup: { inline_keyboard: [] },
+            }).catch(() => {});
+          }
+          u.message = {
+            message_id: cb.message?.message_id,
+            chat: cb.message?.chat,
+            from: cb.from,
+            text: (cb.data || "").trim(),
+          };
+        }
+
         const msg = u.message;
         const chatId = msg?.chat?.id;
         const userId = msg?.from?.id;
         const username = msg?.from?.username || msg?.from?.first_name || "unknown";
 
         if (!msg) {
-          console.log(`[telegram] update ${u.update_id}: no message object (edited_message, callback_query, etc.) — skipped`);
+          console.log(`[telegram] update ${u.update_id}: no message object (edited_message, etc.) — skipped`);
           continue;
         }
 
@@ -2162,6 +2263,8 @@ async function pollTelegram() {
                   "/voice or /graham — Toggle reply with audio (TTS)",
                   "/quiet or /nothinking — Toggle quiet replies (one bubble; no streaming paragraphs)",
                   "/status — Show current settings",
+                  "/usage — Show Claude plan quota and token stats",
+                  "/context — Token breakdown by session",
                   "/help — Show this message",
                   "",
                   "Send a voice note to speak instead of typing. Any other message is sent to the agent.",
@@ -2205,6 +2308,112 @@ async function pollTelegram() {
                 saveTelegramChatState();
                 const ts = (chosen.updatedAt || "").slice(0, 16).replace("T", " ");
                 await sendTelegramMessage(chatId, `Switched to conversation ${num} (updated ${ts}). Your next message will use this context.`);
+                continue;
+              }
+              case "usage": {
+                const usageScript = path.join(WORKSPACE, ".claude/skills/claude-usage/scripts/usage_report.py");
+                try {
+                  const { execFile } = require("child_process");
+                  const output = await new Promise((resolve) => {
+                    execFile("python3", [usageScript], { timeout: 30000 }, (err, stdout, stderr) => {
+                      const raw = (stdout || stderr || "No usage data available.").replace(/\x1b\[[0-9;]*m/g, "");
+                      resolve(raw.trim());
+                    });
+                  });
+                  await sendTelegramMessage(chatId, "```\n" + output + "\n```");
+                } catch (e) {
+                  await sendTelegramMessage(chatId, `Could not fetch usage: ${e.message}`);
+                }
+                continue;
+              }
+              case "context": {
+                const contextScript = path.join(WORKSPACE, ".claude/skills/claude-usage/scripts/context_report.py");
+                const contextArgs = ["python3", contextScript];
+                if (cmdArg === "session" || cmdArg === "--session") contextArgs.push("--session");
+                else if (cmdArg === "all") contextArgs.push("--all");
+                try {
+                  const { execFile } = require("child_process");
+                  const output = await new Promise((resolve) => {
+                    execFile(contextArgs[0], contextArgs.slice(1), { timeout: 30000 }, (err, stdout, stderr) => {
+                      const raw = (stdout || stderr || "No context data available.").replace(/\x1b\[[0-9;]*m/g, "");
+                      resolve(raw.trim());
+                    });
+                  });
+                  const truncated = output.length > 3800 ? output.slice(0, 3800) + "\n…(truncated)" : output;
+                  await sendTelegramMessage(chatId, "```\n" + truncated + "\n```");
+                } catch (e) {
+                  await sendTelegramMessage(chatId, `Could not fetch context report: ${e.message}`);
+                }
+                continue;
+              }
+              case "ping": {
+                const s = getChatState(chatId);
+                const model = s.model || "sonnet";
+                const effort = s.effort || "medium";
+                const sessionCount = (s.sessionIds || []).length;
+                const ts = new Date().toLocaleTimeString("en-GB", { timeZone: "Europe/London", hour: "2-digit", minute: "2-digit" });
+                await sendTelegramMessage(chatId, `Online ✓\nModel: ${model} | Effort: ${effort}\nSessions: ${sessionCount} | ${ts}`);
+                continue;
+              }
+              case "todo":
+              case "tasks": {
+                const taskScript = path.join(WORKSPACE, ".claude/skills/task-manager/scripts/task_db.py");
+                const { execFile: execFileTodo } = require("child_process");
+                const todoOut = await new Promise((resolve) => {
+                  execFileTodo("python3", [taskScript, "list"], { timeout: 10000, cwd: WORKSPACE, env: { ...process.env } }, (err, stdout) => {
+                    try {
+                      const data = JSON.parse(stdout || "{}");
+                      const tasks = (data.tasks || []).filter(t => t.status !== "completed");
+                      if (tasks.length === 0) { resolve("No pending tasks."); return; }
+                      const lines = [`📋 Tasks (${tasks.length}):\n`];
+                      tasks.forEach((t, i) => {
+                        const due = t.due_date ? ` · ${t.due_date.slice(0, 10)}` : "";
+                        const proj = t.project ? ` [${t.project}]` : "";
+                        lines.push(`${i + 1}. ${t.title}${proj}${due}`);
+                      });
+                      resolve(lines.join("\n"));
+                    } catch { resolve(stdout?.trim() || "Could not fetch tasks."); }
+                  });
+                });
+                await sendTelegramMessage(chatId, todoOut);
+                continue;
+              }
+              case "brief": {
+                const briefScript = path.join(WORKSPACE, "scripts/daily_briefing_telegram.py");
+                await sendTelegramMessage(chatId, "Generating your briefing… it'll arrive in a moment.");
+                const { spawn: spawnBrief } = require("child_process");
+                spawnBrief("python3", [briefScript], { cwd: WORKSPACE, env: { ...process.env }, stdio: "ignore", detached: true }).unref();
+                continue;
+              }
+              case "farsley": {
+                const farsleyPath = path.join(WORKSPACE, "context/farsley-house.md");
+                try {
+                  const raw = fs.readFileSync(farsleyPath, "utf8");
+                  // Extract sections up to char limit — prioritise status/tasks over boilerplate
+                  const truncated = raw.length > 3500 ? raw.slice(0, 3500) + "\n\n…(truncated)" : raw;
+                  await sendTelegramMessage(chatId, truncated);
+                } catch (e) {
+                  await sendTelegramMessage(chatId, `Could not load Farsley context: ${e.message}`);
+                }
+                continue;
+              }
+              case "remember": {
+                if (!cmdArg) {
+                  await sendTelegramMessage(chatId, "Usage: /remember <text>\nExample: /remember Check the gate hinges next Farsley visit");
+                  continue;
+                }
+                const memScript = path.join(WORKSPACE, ".claude/skills/memory/scripts/mem0_add.py");
+                const { execFile: execFileMem } = require("child_process");
+                const memOut = await new Promise((resolve) => {
+                  execFileMem("python3", [memScript, "--content", cmdArg, "--metadata", JSON.stringify({ source: "telegram-command" })],
+                    { timeout: 30000, cwd: WORKSPACE, env: { ...process.env } },
+                    (err, stdout, stderr) => {
+                      if (err) resolve(`Failed: ${(stderr || err.message || "").slice(0, 200)}`);
+                      else resolve("✓ Remembered.");
+                    }
+                  );
+                });
+                await sendTelegramMessage(chatId, memOut);
                 continue;
               }
               default:
