@@ -61,13 +61,14 @@ const CLI_PROFILES = {
   claude: {
     bin: process.env.CLAUDE_BIN || "claude",
     label: "Claude Code",
-    buildArgs(prompt, sessionId, model, mode, _geminiSessionId) {
+    buildArgs(prompt, sessionId, model, mode, _geminiSessionId, effort) {
       const args = ["--print", "--output-format", "stream-json", "--verbose", "--include-partial-messages"];
       if (!isRootUnixProcess()) {
         args.push("--dangerously-skip-permissions");
       }
       args.push("--model", model === "auto" || !model ? "sonnet" : model);
       if (mode) args.push("--mode", mode);
+      if (effort && effort !== "medium") args.push("--effort", effort);
       if (sessionId) args.push("--resume", sessionId);
       args.push(prompt);
       return args;
@@ -257,6 +258,7 @@ function getChatState(chatId) {
       sessionIds: [],
       geminiSessionId: null,
       model: "auto",
+      effort: "medium",
       cli: currentCli,
       voiceReply: false,
       muteStreamUpdates: false,
@@ -275,7 +277,18 @@ function getTelegramChatThreads(chatId, limit = 50) {
   const chatIdStr = String(chatId);
   for (const id of ids) {
     const data = loadConversation(id);
-    if (!data) continue;
+    if (!data) {
+      // Current active session has no file yet (written only when session ends)
+      if (id === state.sessionId) {
+        byId.set(id, {
+          id,
+          updatedAt: new Date().toISOString(),
+          messageCount: 0,
+          preview: "(active)",
+        });
+      }
+      continue;
+    }
     if (data.telegramChatId !== chatIdStr) {
       data.telegramChatId = chatIdStr;
       try {
@@ -1730,7 +1743,7 @@ function runAgentForTelegram(chatId, prompt, replyToMessageId) {
   const profile = CLI_PROFILES[state.cli] || CLI_PROFILES[currentCli] || CLI_PROFILES.agent;
   const promptWithContext = buildPromptContext() + prompt;
   const gemSid = state.cli === "gemini" ? state.geminiSessionId || null : null;
-  const args = profile.buildArgs(promptWithContext, state.sessionId, state.model, undefined, gemSid);
+  const args = profile.buildArgs(promptWithContext, state.sessionId, state.model, undefined, gemSid, state.effort);
 
   if (DEBUG) console.log(`[telegram] spawn ${state.cli} for chat ${chatId}: ${profile.bin} ${args.slice(0, -1).join(" ")} "<prompt>"`);
 
@@ -2037,6 +2050,7 @@ async function pollTelegram() {
         { command: "convos", description: "List recent conversations" },
         { command: "convo", description: "Switch to conversation (e.g. /convo 1)" },
         { command: "model", description: "Set model (e.g. /model sonnet)" },
+        { command: "effort", description: "Set effort level (e.g. /effort high)" },
         { command: "agent", description: "Switch CLI agent (e.g. /agent claude)" },
         { command: "voice", description: "Toggle reply with audio (TTS)" },
         { command: "quiet", description: "Toggle: final reply only (no stream chunks)" },
@@ -2213,6 +2227,25 @@ async function pollTelegram() {
                 }
                 continue;
               }
+              case "effort": {
+                const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
+                if (!cmdArg) {
+                  await sendTelegramMessage(chatId,
+                    `Current effort: ${state.effort || "medium"}\n\nUsage: /effort <level>\nLevels: ${EFFORT_LEVELS.join(", ")}`);
+                } else {
+                  const level = cmdArg.toLowerCase();
+                  if (!EFFORT_LEVELS.includes(level)) {
+                    await sendTelegramMessage(chatId,
+                      `Unknown effort level: "${level}"\nAvailable: ${EFFORT_LEVELS.join(", ")}`);
+                  } else {
+                    state.effort = level;
+                    saveTelegramChatState();
+                    console.log(`[telegram] /${cmd} ${level} from ${username} — effort set to ${level}`);
+                    await sendTelegramMessage(chatId, `Effort set to: ${level}`);
+                  }
+                }
+                continue;
+              }
               case "agent":
               case "cli": {
                 const available = Object.keys(CLI_PROFILES);
@@ -2242,6 +2275,7 @@ async function pollTelegram() {
                 const lines = [
                   `Agent: ${state.cli} (${profile.label || "unknown"})`,
                   `Model: ${state.model}`,
+                  `Effort: ${state.effort || "medium"}`,
                   `Session: ${state.cli === "gemini" ? state.geminiSessionId || "none" : state.sessionId || "none"}`,
                   `Reply with audio (TTS): ${state.voiceReply ? "on" : "off"} — /voice or /graham to toggle`,
                   `Quiet mode (no stream chunks): ${state.muteStreamUpdates ? "on" : "off"} — /quiet or /nothinking to toggle`,
@@ -2259,6 +2293,7 @@ async function pollTelegram() {
                   "/convos or /conversations — List recent conversations",
                   "/convo <n> — Switch to conversation n (e.g. /convo 1)",
                   "/model <name> — Set model (e.g. sonnet, opus, auto)",
+                  "/effort <level> — Set effort level (low, medium, high, xhigh, max)",
                   "/agent <name> — Switch CLI agent (e.g. agent, claude)",
                   "/voice or /graham — Toggle reply with audio (TTS)",
                   "/quiet or /nothinking — Toggle quiet replies (one bubble; no streaming paragraphs)",
@@ -2276,6 +2311,7 @@ async function pollTelegram() {
               case "convos": {
                 const listLimit = cmdArg && /^\d+$/.test(cmdArg) ? Math.min(parseInt(cmdArg, 10), 50) : 20;
                 const threads = getTelegramChatThreads(chatId, listLimit);
+                fs.appendFileSync("/tmp/convos-debug.log", `[${new Date().toISOString()}] chatId=${chatId} threads=${threads.length} sessionIds=${getChatState(chatId).sessionIds?.length}\n`);
                 if (threads.length === 0) {
                   await sendTelegramMessage(chatId, "No conversations yet. Send a message to start one; use /new to start a fresh thread.");
                   continue;
@@ -2307,7 +2343,19 @@ async function pollTelegram() {
                 state.sessionId = chosen.id;
                 saveTelegramChatState();
                 const ts = (chosen.updatedAt || "").slice(0, 16).replace("T", " ");
-                await sendTelegramMessage(chatId, `Switched to conversation ${num} (updated ${ts}). Your next message will use this context.`);
+                const convoData = loadConversation(chosen.id);
+                const convoLines = [`Switched to conversation ${num} (${ts}, ${chosen.messageCount} msgs).`];
+                if (convoData?.messages?.length) {
+                  const firstUser = convoData.messages.find((m) => m.role === "user");
+                  const lastUser = [...convoData.messages].reverse().find((m) => m.role === "user");
+                  if (firstUser) {
+                    convoLines.push(`Started: "${String(firstUser.content).replace(/\s+/g, " ").trim().slice(0, 120)}"`);
+                  }
+                  if (lastUser && lastUser !== firstUser) {
+                    convoLines.push(`Last: "${String(lastUser.content).replace(/\s+/g, " ").trim().slice(0, 120)}"`);
+                  }
+                }
+                await sendTelegramMessage(chatId, convoLines.join("\n"));
                 continue;
               }
               case "usage": {
