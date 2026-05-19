@@ -1738,7 +1738,7 @@ async function sendOptionsKeyboard(chatId, options) {
   }
 }
 
-function runAgentForTelegram(chatId, prompt, replyToMessageId) {
+function runAgentForTelegram(chatId, prompt, replyToMessageId, tmpFiles = []) {
   const state = getChatState(chatId);
   const profile = CLI_PROFILES[state.cli] || CLI_PROFILES[currentCli] || CLI_PROFILES.agent;
   const promptWithContext = buildPromptContext() + prompt;
@@ -2009,6 +2009,7 @@ function runAgentForTelegram(chatId, prompt, replyToMessageId) {
     if (session.id && assistantText.trim()) {
       saveConversationTurn(session.id, "auto", session.startedAt, prompt, fullResponseText || sanitizeAgentOutputForTelegram(assistantText.trim()), { telegramChatId: chatId });
     }
+    for (const f of tmpFiles) { try { fs.unlinkSync(f); } catch (e) {} }
   });
 
   proc.on("error", async (err) => {
@@ -2129,6 +2130,7 @@ async function pollTelegram() {
           : msg.caption ? "caption-only" : "other";
 
         let promptText = (msg.text || "").trim();
+        let photoTmpFiles = [];
         if (!promptText && msg.voice) {
           telegramApi("setMessageReaction", {
             chat_id: chatId, message_id: msg.message_id,
@@ -2148,6 +2150,26 @@ async function pollTelegram() {
             await sendTelegramMessage(chatId, "Could not transcribe the voice note. Please try again or send text.");
             continue;
           }
+        }
+
+        // Handle photo messages and image documents
+        const isImageDoc = msg.document && (msg.document.mime_type || "").startsWith("image/");
+        if (!promptText && (msg.photo || isImageDoc)) {
+          telegramApi("setMessageReaction", {
+            chat_id: chatId, message_id: msg.message_id,
+            reaction: [{ type: "emoji", emoji: "🖼" }],
+          }).catch(() => {});
+          telegramApi("sendChatAction", { chat_id: chatId, action: "typing" }).catch(() => {});
+          const fileId = msg.photo ? msg.photo[msg.photo.length - 1].file_id : msg.document.file_id;
+          const tmpPath = await downloadTelegramFile(fileId);
+          if (!tmpPath) {
+            await sendTelegramMessage(chatId, "Could not download the photo. Please try again.");
+            continue;
+          }
+          const caption = (msg.caption || "").trim();
+          promptText = `[Image attached at: ${tmpPath} — use the Read tool to view it]\n\n${caption || "Please describe what you see in this image."}`;
+          console.log(`[telegram] photo saved: ${tmpPath}, caption: "${caption}"`);
+          photoTmpFiles = [tmpPath];
         }
 
         if (!promptText) {
@@ -2476,7 +2498,7 @@ async function pollTelegram() {
             reaction: [{ type: "emoji", emoji: "👀" }],
           }).catch(() => {});
           console.log(`[telegram] dispatching to ${getChatState(chatId).cli} for chat ${chatId}`);
-          runAgentForTelegram(chatId, promptText, msg.message_id);
+          runAgentForTelegram(chatId, promptText, msg.message_id, photoTmpFiles);
         } catch (err) {
           console.log(`[telegram] error processing update ${u.update_id}: ${err.message}`);
         }
