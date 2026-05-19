@@ -1710,12 +1710,19 @@ async function sendTelegramMessage(chatId, text, opts = {}) {
  *  off the end of an agent reply. Returns the cleaned text and the options. */
 function extractOptionsBlock(text) {
   const s = String(text || "");
-  const m = s.match(/\n*<options>\s*([\s\S]*?)\s*<\/options>\s*$/i);
+  // Find the LAST <options> tag so examples in code blocks don't get picked up
+  const lastIdx = s.toLowerCase().lastIndexOf("<options>");
+  if (lastIdx === -1) return { text: s, options: null };
+  // Skip if inside a fenced code block (odd number of ``` before it)
+  const before = s.slice(0, lastIdx);
+  if (((before.match(/```/g) || []).length) % 2 !== 0) return { text: s, options: null };
+  // Require </options> at the very end
+  const tail = s.slice(lastIdx);
+  const m = tail.match(/^<options>\s*([\s\S]*?)\s*<\/options>\s*$/i);
   if (!m) return { text: s, options: null };
-  const options = m[1]
-    .split("\n").map((l) => l.trim()).filter(Boolean).slice(0, 12);
+  const options = m[1].split("\n").map((l) => l.trim()).filter(Boolean).slice(0, 12);
   return {
-    text: s.slice(0, m.index).trimEnd(),
+    text: before.replace(/\n+$/, ""),
     options: options.length ? options : null,
   };
 }
