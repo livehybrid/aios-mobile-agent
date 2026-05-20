@@ -1666,9 +1666,11 @@ async function sendTelegramVoice(chatId, audioPath) {
   }
 }
 async function sendTelegramMessage(chatId, text, opts = {}) {
-  const useHtml = opts.parse_mode !== "Markdown" && opts.parse_mode !== "MarkdownV2";
+  // parse_mode: "" means send as plain text with no mode (safe fallback for structured lists)
+  const forcePlain = opts.parse_mode === "";
+  const useHtml = !forcePlain && opts.parse_mode !== "Markdown" && opts.parse_mode !== "MarkdownV2";
   const htmlBody = useHtml ? markdownToTelegramHtml(text) : text;
-  const parseMode = useHtml ? "HTML" : (opts.parse_mode || "");
+  const parseMode = forcePlain ? "" : (useHtml ? "HTML" : (opts.parse_mode || ""));
 
   const makeChunks = (body) => {
     const chunks = [];
@@ -1680,13 +1682,15 @@ async function sendTelegramMessage(chatId, text, opts = {}) {
 
   const chunks = makeChunks(htmlBody);
   for (let i = 0; i < chunks.length; i++) {
-    const result = await telegramApi("sendMessage", {
+    const payload = {
       chat_id: chatId,
       text: chunks[i],
-      parse_mode: parseMode,
       disable_web_page_preview: true,
       ...opts,
-    });
+    };
+    if (parseMode) payload.parse_mode = parseMode;
+    else delete payload.parse_mode;
+    const result = await telegramApi("sendMessage", payload);
     if (!result.ok) {
       if (result.error_code === 400 && result.description?.includes("parse entities")) {
         if (DEBUG) console.log("[telegram] HTML parse failed, falling back to plain text");
@@ -1701,7 +1705,7 @@ async function sendTelegramMessage(chatId, text, opts = {}) {
         }
         return;
       }
-      if (DEBUG) console.log("[telegram] sendMessage error:", result);
+      console.log("[telegram] sendMessage error:", JSON.stringify(result).slice(0, 200));
     }
   }
 }
@@ -2340,17 +2344,17 @@ async function pollTelegram() {
               case "convos": {
                 const listLimit = cmdArg && /^\d+$/.test(cmdArg) ? Math.min(parseInt(cmdArg, 10), 50) : 20;
                 const threads = getTelegramChatThreads(chatId, listLimit);
-                fs.appendFileSync("/tmp/convos-debug.log", `[${new Date().toISOString()}] chatId=${chatId} threads=${threads.length} sessionIds=${getChatState(chatId).sessionIds?.length}\n`);
                 if (threads.length === 0) {
-                  await sendTelegramMessage(chatId, "No conversations yet. Send a message to start one; use /new to start a fresh thread.");
+                  await sendTelegramMessage(chatId, "No conversations yet. Send a message to start one; use /new to start a fresh thread.", { parse_mode: "" });
                   continue;
                 }
-                const lines = ["Recent conversations (use /convo <n> to switch):\n"];
+                const lines = ["Recent conversations (tap /convo N to switch):\n"];
                 threads.forEach((t, i) => {
                   const ts = (t.updatedAt || "").slice(0, 16).replace("T", " ");
-                  lines.push(`${i + 1}. [${ts}] ${t.messageCount} msgs — ${t.preview}`);
+                  const preview = String(t.preview || "").replace(/\n/g, " ").slice(0, 60);
+                  lines.push(`${i + 1}. [${ts}] ${t.messageCount} msgs - ${preview}`);
                 });
-                await sendTelegramMessage(chatId, lines.join("\n"));
+                await sendTelegramMessage(chatId, lines.join("\n"), { parse_mode: "" });
                 continue;
               }
               case "convo": {
@@ -2434,23 +2438,26 @@ async function pollTelegram() {
               }
               case "todo":
               case "tasks": {
-                const taskScript = path.join(WORKSPACE, ".claude/skills/task-manager/scripts/task_db.py");
+                const tududiScript = path.join(WORKSPACE, ".claude/skills/tududi/scripts/tududi_client.py");
                 const { execFile: execFileTodo } = require("child_process");
                 const todoOut = await new Promise((resolve) => {
-                  execFileTodo("python3", [taskScript, "list"], { timeout: 10000, cwd: WORKSPACE, env: { ...process.env } }, (err, stdout) => {
-                    try {
-                      const data = JSON.parse(stdout || "{}");
-                      const tasks = (data.tasks || []).filter(t => t.status !== "completed");
-                      if (tasks.length === 0) { resolve("No pending tasks."); return; }
-                      const lines = [`📋 Tasks (${tasks.length}):\n`];
-                      tasks.forEach((t, i) => {
-                        const due = t.due_date ? ` · ${t.due_date.slice(0, 10)}` : "";
-                        const proj = t.project ? ` [${t.project}]` : "";
-                        lines.push(`${i + 1}. ${t.title}${proj}${due}`);
-                      });
-                      resolve(lines.join("\n"));
-                    } catch { resolve(stdout?.trim() || "Could not fetch tasks."); }
-                  });
+                  execFileTodo("python3", [tududiScript, "tasks", "list", "--status", "pending"],
+                    { timeout: 15000, cwd: WORKSPACE, env: { ...process.env } },
+                    (err, stdout, stderr) => {
+                      try {
+                        const data = JSON.parse(stdout || "{}");
+                        const tasks = data.tasks || [];
+                        if (tasks.length === 0) { resolve("No pending tasks."); return; }
+                        const lines = [`Tasks (${tasks.length}):\n`];
+                        tasks.slice(0, 20).forEach((t, i) => {
+                          const due = t.due_date ? ` · ${t.due_date.slice(0, 10)}` : "";
+                          const proj = t.Project?.name ? ` [${t.Project.name}]` : "";
+                          lines.push(`${i + 1}. ${t.name}${proj}${due}`);
+                        });
+                        if (tasks.length > 20) lines.push(`…and ${tasks.length - 20} more`);
+                        resolve(lines.join("\n"));
+                      } catch { resolve(stdout?.trim() || stderr?.trim() || "Could not fetch tasks."); }
+                    });
                 });
                 await sendTelegramMessage(chatId, todoOut);
                 continue;
